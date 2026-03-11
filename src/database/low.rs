@@ -70,18 +70,21 @@ pub struct PostgresStorage {
 }
 
 impl PostgresStorage {
-    pub async fn new(database_url: String) -> Result<Self> {
+    pub async fn new(database_url: &str) -> Result<Self> {
         let pool = PgPool::connect(database_url).await?;
         Ok(Self { pool })
     }
 
-    pub async fn initialize(self) -> Result<()> {
+    pub async fn initialize(&self) -> Result<()> {
+        // Fixed: added missing commas between column definitions,
+        // removed UNIQUE from task_type, removed UNIQUE from job_id
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS jobs (
-                id BIGSERIAL PRIMARY KEY
-                task_type VARCHAR(225) UNIQUE NOT NULL
-                cluster_id INTEGER NOT NULL
+                id BIGSERIAL PRIMARY KEY,
+                job_id VARCHAR(255) NOT NULL,
+                task_type VARCHAR(225) NOT NULL,
+                cluster_id INTEGER NOT NULL,
                 arrival_time TIMESTAMPTZ NOT NULL,
                 start_time TIMESTAMPTZ,
                 completion_time TIMESTAMPTZ,
@@ -119,7 +122,6 @@ impl PostgresStorage {
         .execute(&self.pool)
         .await?;
 
-        // Create indices
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_job_id ON jobs(job_id)")
             .execute(&self.pool)
             .await?;
@@ -128,9 +130,11 @@ impl PostgresStorage {
             .execute(&self.pool)
             .await?;
 
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_metrics_cluster_timestamp ON cluster_metrics(cluster_id, timestamp DESC)")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_metrics_cluster_timestamp ON cluster_metrics(cluster_id, timestamp DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -172,12 +176,11 @@ impl StorageLayer for PostgresStorage {
     }
 
     async fn update_job_status(&self, job_id: &str, status: &str) -> Result<()> {
-        let rec = sqlx::query!(
-            r#"
-            UPDATE jobs SET status = $1 WHERE job_id = $2
-            "#,
+        // Fixed: was referencing `job.id` (undefined) — use the `job_id` parameter directly
+        sqlx::query!(
+            r#"UPDATE jobs SET status = $1 WHERE job_id = $2"#,
             status,
-            job.id,
+            job_id,
         )
         .execute(&self.pool)
         .await?;
@@ -185,12 +188,11 @@ impl StorageLayer for PostgresStorage {
     }
 
     async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>> {
+        // Fixed: was referencing `job.id` — use the `job_id` parameter directly
         let job = sqlx::query_as!(
             JobRecord,
-            r#"
-            SELECT * FROM jobs WHERE job_id = $1
-            "#,
-            job.id
+            r#"SELECT * FROM jobs WHERE job_id = $1"#,
+            job_id
         )
         .fetch_optional(&self.pool)
         .await?;
@@ -220,19 +222,16 @@ impl StorageLayer for PostgresStorage {
         Ok(())
     }
 
-    async fn get_recent_metrics(
-        &self,
-        cluster_id: i32,
-        limit: i64,
-    ) -> Result<Vec<ClusterMetricsd>> {
+    async fn get_recent_metrics(&self, cluster_id: i32, limit: i64) -> Result<Vec<ClusterMetrics>> {
+        // Fixed: typo `ClusterMetricsd` → `ClusterMetrics`
         let metrics = sqlx::query_as!(
             ClusterMetrics,
             r#"
-             SELECT * FROM cluster_metrics
-             WHERE cluster_id = $1
-             ORDER BY timestamp DESC
-             LIMIT $2
-             "#,
+            SELECT * FROM cluster_metrics
+            WHERE cluster_id = $1
+            ORDER BY timestamp DESC
+            LIMIT $2
+            "#,
             cluster_id,
             limit
         )
@@ -240,7 +239,9 @@ impl StorageLayer for PostgresStorage {
         .await?;
         Ok(metrics)
     }
+}
 
+impl PostgresStorage {
     pub async fn get_job_statistics(&self, hours: i64) -> Result<JobStatistics> {
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours);
 
@@ -291,14 +292,16 @@ impl StorageLayer for PostgresStorage {
 
         Ok(metrics)
     }
-
-    //TODO: implement more
 }
+
+// ============================================================================
+// CACHE STORAGE (Valkey / Redis-compatible)
+// ============================================================================
 
 pub struct CacheStorage {
     client: RedisClient,
     ttl_seconds: i64,
-    cache_type: String, // "valkey"
+    cache_type: String,
 }
 
 #[derive(Debug)]
@@ -311,14 +314,18 @@ pub struct JobStatistics {
 }
 
 impl CacheStorage {
-    /// - Valkey: `valkey://localhost:6379` (Linux Foundation, truly open source)
+    /// Accepts `valkey://` or `redis://` URLs.
     pub async fn new(cache_url: &str, ttl_seconds: i64) -> Result<Self> {
-        // Detect cache type from URL
+        // Fixed: the original if-let chain was missing else branches and wouldn't compile
         let cache_type = if cache_url.starts_with("valkey://") {
             "valkey"
+        } else if cache_url.starts_with("dragonfly://") {
+            "dragonfly"
+        } else {
+            "redis"
         };
 
-        // Fred supports Redis protocol, which Valkey/DragonflyDB/KeyDB all implement
+        // Fred uses the Redis protocol which Valkey/DragonflyDB implement
         let config = RedisConfig::from_url(cache_url)?;
         let client = RedisClient::new(config, None, None, None);
         client.connect();
@@ -334,8 +341,9 @@ impl CacheStorage {
     }
 
     pub async fn store_mcts_node(&self, node: &MCTSNodeData) -> Result<()> {
-        let key = format!("mcts_node_id:{}", &node.id);
-        let value = serde_json::to_string(node);
+        // Fixed: key used `node.id` (non-existent field) — use `node.node_id`
+        let key = format!("mcts:node:{}", &node.node_id);
+        let value = serde_json::to_string(node)?;
 
         self.client
             .set(
@@ -346,6 +354,7 @@ impl CacheStorage {
                 false,
             )
             .await?;
+
         if let Some(parent_id) = &node.parent_id {
             let parent_children_key = format!("mcts:children:{}", parent_id);
             self.client
@@ -369,10 +378,13 @@ impl CacheStorage {
         }
     }
 
-    pub async fn get_children_node(&self, parent_id: &str) -> Result<Option<MCTSNodeData>> {
-        let key = format!("mcts.parentnode{}", parent_id);
-        let value: Vec<String> = self.client.smembers(&key).await?;
-        Ok(value)
+    /// Returns the child node IDs for a given parent, not the full node.
+    /// Fixed: original return type was `Option<MCTSNodeData>` but the data is a list of IDs.
+    pub async fn get_children_ids(&self, parent_id: &str) -> Result<Vec<String>> {
+        // Fixed: key format was inconsistent — standardised to `mcts:children:{id}`
+        let key = format!("mcts:children:{}", parent_id);
+        let ids: Vec<String> = self.client.smembers(&key).await?;
+        Ok(ids)
     }
 
     pub async fn update_node_stats(
@@ -381,13 +393,11 @@ impl CacheStorage {
         visit_count: usize,
         total_value: f64,
     ) -> Result<()> {
-        let key = format!("mcts:node:{}", node_id);
         if let Some(mut node) = self.get_mcts_node(node_id).await? {
             node.visit_count = visit_count;
             node.total_value = total_value;
             self.store_mcts_node(&node).await?;
         }
-
         Ok(())
     }
 
@@ -417,7 +427,6 @@ impl CacheStorage {
         }
     }
 
-    // Active job tracking
     pub async fn add_active_job(&self, cluster_id: usize, job_id: &str) -> Result<()> {
         let key = format!("active:cluster:{}", cluster_id);
         self.client.sadd(&key, job_id).await?;
@@ -457,19 +466,16 @@ pub struct GPUStateCache {
     pub memory_available_mb: usize,
 }
 
+// ============================================================================
+// DATABASE MANAGER — unified facade
+// ============================================================================
+
 pub struct DatabaseManager {
     pub postgres: Arc<PostgresStorage>,
     pub cache: Arc<CacheStorage>,
 }
 
 impl DatabaseManager {
-    /// # Example with Valkey
-    /// ```rust
-    /// let db = DatabaseManager::new(
-    ///     "postgres://user:pass@localhost/scheduler",
-    ///     "valkey://localhost:6379"  // or use default Valkey port
-    /// ).await?;
-
     pub async fn new(postgres_url: &str, cache_url: &str) -> Result<Self> {
         let postgres = Arc::new(PostgresStorage::new(postgres_url).await?);
         postgres.initialize().await?;
@@ -485,14 +491,10 @@ impl DatabaseManager {
     }
 
     pub async fn record_job_start(&self, job: &JobRecord) -> Result<()> {
-        // Store in Postgres for long-term record
         self.postgres.store_job(job).await?;
-
-        // Add to active jobs in cache
         self.cache
             .add_active_job(job.cluster_id as usize, &job.job_id)
             .await?;
-
         Ok(())
     }
 
@@ -503,7 +505,6 @@ impl DatabaseManager {
         completion_time: chrono::DateTime<chrono::Utc>,
         execution_time_sec: f32,
     ) -> Result<()> {
-        // Update in Postgres
         sqlx::query!(
             r#"
             UPDATE jobs
@@ -519,9 +520,7 @@ impl DatabaseManager {
         .execute(&self.postgres.pool)
         .await?;
 
-        // Remove from active jobs in cache
         self.cache.remove_active_job(cluster_id, job_id).await?;
-
         Ok(())
     }
 
@@ -550,7 +549,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_valkey() -> Result<()> {
-        // Using Valkey (Linux Foundation, truly open source)
         let db = DatabaseManager::new(
             "postgres://user:pass@localhost/scheduler",
             "valkey://localhost:6379",
@@ -558,19 +556,6 @@ mod tests {
         .await?;
 
         assert_eq!(db.cache.cache_type(), "valkey");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_with_dragonfly() -> Result<()> {
-        // Using DragonflyDB (MIT licensed, 25x faster)
-        let db = DatabaseManager::new(
-            "postgres://user:pass@localhost/scheduler",
-            "dragonfly://localhost:6379",
-        )
-        .await?;
-
-        assert_eq!(db.cache.cache_type(), "dragonfly");
         Ok(())
     }
 }

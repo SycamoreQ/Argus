@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use tch::{nn, Device, IndexOp, Kind, Tensor};
+use chrono::{DateTime, Duration, Utc};
+use RL::env::*
 
 pub struct ScatterGather;
 
@@ -349,6 +351,7 @@ impl HAN {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct GraphTensors {
     pub node_features: Tensor,
     pub node_types: Tensor,
@@ -359,6 +362,34 @@ pub struct GraphTensors {
     pub pending_indices: Vec<i64>,
     pub running_indices: Vec<i64>,
 }
+
+impl GraphTensor{
+    pub fn new() -> Self { 
+        Self { 
+            node_features: Tensor::new([] , device=Device), 
+            node_type: Tensor::new([] , device =Device), 
+            edge_index: Tensor::new([] , device =Device), 
+            edge_type: Tensor::new([] , device =Device), 
+            num_nodes: 0.0,
+            cluster_indices :Vec::new(),
+            pending_indices: Vec::new(),
+            running_indices: Vec::new()
+        };
+    }
+    
+    pub fn add_cluster(&self , cluster_features: &[ClusterFeatures]){
+        
+    }
+}
+
+// resize handles both directions —
+// pads with 0.0 if too short, silently truncates if somehow over 32.
+//  Call it inside every add_* method in HANGraph before pushing to node_features, so the padding logic lives in exactly one place.
+fn pad_to_feature_dim(mut v: Vec<f32>) -> Vec<f32> {
+    v.resize(GRAPH_FEATURE_DIM, 0.0);
+    v
+}
+
 
 #[cfg(test)]
 mod tests {
